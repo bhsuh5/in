@@ -1,0 +1,96 @@
+ame: Integrate (Workflow)
+
+on:
+  pull_request:
+    branches: [ "develop", "release*"]
+
+jobs:
+  cicd-init:
+    name: Initialize Pipeline
+    runs-on: [ self-hosted ]
+    outputs:
+      parent_poms: ${{steps.cicd_yaml_parser.outputs.parent_poms}}
+      jenkins_job_path: ${{steps.cicd_yaml_parser.outputs.jenkins_job_path}}
+      build_publish_yml: ${{steps.cicd_yaml_parser.outputs.build_publish_yml}}
+      build_registry_repo: ${{steps.cicd_yaml_parser.outputs.build_registry_repo}}
+      is_deployable_artifact: ${{steps.cicd_yaml_parser.outputs.is_deployable_artifact}}
+    steps:
+      - name: Resolve Properties for cicd.yaml
+        id: cicd_yaml_parser
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/cicd_yaml_parser@v1
+        with:
+          get: "[parent_poms, build_publish_yml, jenkins_job_path, build_registry_repo]"
+  linear-history-check:
+    name: Linear History Check
+    runs-on: [ self-hosted ]
+    steps:
+      - name: Check Linear History
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/linear_history_check@v1
+  auto-release-eval:
+    name: Auto-Tag Release Check
+    needs: [cicd-init, linear-history-check]
+    runs-on: [ self-hosted ]
+    outputs:
+      is_auto_release: ${{steps.evaluate-commit.outputs.trigger_auto_tag}}
+    steps:
+      - name: Evaluate Commit for Auto-Tagging
+        id: evaluate-commit
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/tag_release_check@v1
+        with:
+          parent_poms: ${{needs.cicd-init.outputs.parent_poms}}
+  verify:
+    name: Verify Release
+    needs: [cicd-init, auto-release-eval]
+    runs-on: [ self-hosted ]
+    outputs: 
+      JIRA_ISSUE: ${{steps.jira-verification.outputs.JIRA_ISSUE}}
+      JIRA_FIX_VERSION: ${{steps.jira-verification.outputs.JIRA_FIX_VERSION}}
+    steps:
+      - if: needs.auto-release-eval.outputs.is_auto_release != 'True'
+        name: Checkout Application Repository
+        uses: actions/checkout@v3
+      - if: needs.auto-release-eval.outputs.is_auto_release != 'True'
+        run: |
+          git tag -l | xargs git tag -d;
+          git fetch --unshallow --tags;
+      - if: needs.auto-release-eval.outputs.is_auto_release != 'True'
+        id: jira-verification
+        name: Validate Target Release
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/validate-target-release@v1
+        with:
+          jira-pat: ${{ secrets.JIRA_PAT }} 
+          branch: ${{ github.head_ref || github.ref_name }}
+
+
+  build:
+    needs: [cicd-init, verify, auto-release-eval]
+    name: Build & Publish
+    runs-on: [ self-hosted ]
+    outputs:
+      FQMAN: ${{steps.trigger-jenkins-job.outputs.FQMAN}}
+    steps:
+      - if: needs.auto-release-eval.outputs.is_auto_release != 'True'
+        id: trigger-jenkins-job
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/trigger-jenkins-job@v1
+        with:
+          jira_issue: ${{needs.verify.outputs.JIRA_ISSUE}}
+          jenkins-username: ${{ secrets.JENKINS_NPID }}
+          jenkins-server: "https://jenkins.keystone.fyiblue.com"
+          jenkins-pat: ${{ secrets.JENKINS_NPID_PAT_KEYSTONE }}
+          jenkins-job: ${{needs.cicd-init.outputs.jenkins_job_path}}
+          build_publish_yml: ${{needs.cicd-init.outputs.build_publish_yml}}
+          is_mono_repo: ${{needs.cicd-init.outputs.is_mono_repo}}
+  register:
+    needs: [build, verify, cicd-init, auto-release-eval]
+    name: Register SNAPSHOT Build
+    runs-on: [ self-hosted ]
+    steps:
+      - if: needs.auto-release-eval.outputs.is_auto_release != 'True' && ( needs.cicd-init.outputs.is_deployable_artifact == 'True' )
+        name: Register SS Build in Build Registry
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/trigger_register_ss_build@v1
+        with:
+          FQMAN: ${{needs.build.outputs.FQMAN}}
+          jira_issue: ${{needs.verify.outputs.JIRA_ISSUE}}
+          jira_fix_version: ${{needs.verify.outputs.JIRA_FIX_VERSION}}
+          build_registry_repository: ${{needs.cicd-init.outputs.build_registry_repo}}
+          BR_WF_TRIGGER_PAT: ${{secrets.BR_WF_TRIGGER_PAT}}
