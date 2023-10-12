@@ -1,0 +1,125 @@
+import requests
+import csv
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+from datetime import datetime, timedelta
+
+warnings.simplefilter(action='ignore', category=Warning)
+
+PERSONAL_ACCESS_TOKEN = "<PAT>" # provide PAT
+GITHUB_USERNAME = "<username>" # provide username
+REPOSITORY_PREFIX = "Claims-Keystone"
+tower = 'Accums', 'BD', 'BDM', 'Claims-UI'
+BASE_URL = f"https://ghe.fyiblue.com/api/v3/orgs/HCSC-Pilot/repos"
+TOWERS_TO_INCLUDE = ["Accums", "BDM", "BD", "Claims-UI"]
+
+HEADERS = {
+    "Authorization": f"Bearer {PERSONAL_ACCESS_TOKEN}",
+    "Content-Type": "application/json"
+}
+
+session = requests.Session()
+session.headers.update(HEADERS)
+session.verify = False
+auth = (GITHUB_USERNAME, PERSONAL_ACCESS_TOKEN)
+
+def get_start_date():
+    one_month_ago = datetime.now() - timedelta(days=30)
+    return one_month_ago.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def get_paginated_data(url):
+    results = []
+    while url:
+        response = session.get(url)
+        
+        if response.status_code != 200:
+            print(f"Failed to fetch data from {url}. status code : {response.status_code}")
+            return results
+
+        results.extend(response.json())
+        url = response.links.get('next', {}).get('url')  # Continue with the next page if it exists
+        
+    return results
+
+def get_count(url, since_date=None):
+    count = 0
+    if since_date:
+        url = f"{url}&since={since_date}"
+    while url:
+        response = session.get(url)
+        count += len(response.json())
+        url = response.links.get('next', {}).get('url')
+    return count
+
+def get_closed_pr_count(repo_name, repo_url):
+    since_date = get_start_date()
+    return get_count(f"{repo_url}/pulls?state=closed", since_date)
+
+def fetch_branch_data(branch):
+    branch_commit_url = branch['commit']['url']
+    branch_commit_data = session.get(branch_commit_url).json()
+    return branch_commit_data['commit']['committer']['date']
+
+def fetch_repo_data(repo):
+    since_date = get_start_date()
+    repo_name = repo['name']
+    repo_url = repo['url']
+    
+    branches_url = f"{repo_url}/branches"
+    branches_data = get_paginated_data(branches_url)
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        branch_dates = list(executor.map(fetch_branch_data, branches_data))
+    branches_created_in_last_month = sum(1 for date in branch_dates if date > since_date)
+   
+    
+    pr_count_open = get_count(f"{repo_url}/pulls?state=open", since_date)
+    pr_count_closed = get_closed_pr_count(repo_name, repo_url)
+    #issues_count = get_count(f"{BASE_URL}/{repo_name}/issues", since_date)
+    #branches_count = len([b for b in get_paginated_data(f"{repo_url}/branches") if not b['protected']])
+    #commits_count = get_count(f"{BASE_URL}/{repo_name}/commits", since_date)
+
+    tower_name = next((word for word in TOWERS_TO_INCLUDE if word in repo_name), None)
+
+    return {
+        "Name": repo_name,
+        #"Description": repo.get('description', ''),
+        #"URL": repo['html_url'],
+        #"Stars": repo['stargazers_count'],
+        "BranchesCreatedlastmonth": branches_created_in_last_month,
+        "OpenPullRequests": pr_count_open,
+        "ClosedPullRequests": pr_count_closed,
+        #"ActiveBranches": branches_count,
+        #"Commits": commits_count,
+        "Tower": tower_name
+    }
+
+def repo_filter(repo):
+    
+    if not repo['name'].startswith(REPOSITORY_PREFIX):
+        return False
+    return any(word in repo['name'] for word in TOWERS_TO_INCLUDE)
+
+if __name__ == "__main__":
+    repos_url = f"{BASE_URL}"
+    repos = get_paginated_data(repos_url)
+    filtered_repos = [repo for repo in repos if repo_filter(repo)]
+
+    # Using ThreadPoolExecutor to speed up fetching data from multiple repos
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        processed_data = list(executor.map(fetch_repo_data, filtered_repos))
+
+    # Write to CSV
+    csv_path = "github_repositories_with_metrics.csv"
+    with open(csv_path, 'w', newline='') as csvfile:
+        fieldnames = processed_data[0].keys()
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in processed_data:
+            writer.writerow(row)
+
+    # Convert CSV to Excel
+    excel_path = "github_repositories_with_metrics.xlsx"
+    df = pd.read_csv(csv_path)
+    df.to_excel(excel_path, index=False)
