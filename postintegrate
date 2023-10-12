@@ -1,0 +1,52 @@
+name: Post Integrate (Workflow)
+
+on:
+  push:
+    branches: [ "develop", "release-*" ]
+
+jobs:
+  cicd-init:
+    name: Initialize Pipeline
+    runs-on: [ self-hosted ]
+    outputs:
+      parent_poms: ${{steps.cicd_yaml_parser.outputs.parent_poms}}
+      jenkins_job_path: ${{steps.cicd_yaml_parser.outputs.jenkins_job_path}}
+      build_publish_yml: ${{steps.cicd_yaml_parser.outputs.build_publish_yml}}
+      build_registry_repo: ${{steps.cicd_yaml_parser.outputs.build_registry_repo}}
+      is_deployable_artifact: ${{steps.cicd_yaml_parser.outputs.is_deployable_artifact}}
+    steps:
+      - name: Resolve Properties for cicd.yaml
+        id: cicd_yaml_parser
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/cicd_yaml_parser@v1
+        with:
+          get: "[parent_poms, build_publish_yml, jenkins_job_path, build_registry_repo]"
+  auto-release-eval:
+    name: Auto-Tag Release Evaluation
+    needs: [cicd-init]
+    runs-on: [ self-hosted ]
+    outputs:
+      is_auto_release: ${{steps.evaluate-commit.outputs.trigger_auto_tag}}
+      fix_version: ${{steps.evaluate-commit.outputs.fix_version}} 
+    steps:
+      - name: Evaluate Commit for Auto-Tagging
+        id: evaluate-commit
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/tag_release_check@v1
+        with:
+          parent_poms: ${{needs.cicd-init.outputs.parent_poms}}
+  integrate:
+    name: Integrate
+    needs: [auto-release-eval, cicd-init]
+    runs-on: [ self-hosted ]
+    steps:
+      - name: Auto-Tag Release
+        if: needs.auto-release-eval.outputs.is_auto_release == 'True'
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/auto_tag_release@v1
+        with:
+          fix_version: ${{needs.auto-release-eval.outputs.fix_version}}
+      - name: Promote SS Build to DR
+        if: needs.auto-release-eval.outputs.is_auto_release != 'True' && (needs.cicd-init.outputs.is_deployable_artifact == 'True')
+        uses: hcsc-pilot/momentum/ci_pipeline/actions/trigger_promote_ss_build@v1
+        with:
+          build_registry_repository: ${{needs.cicd-init.outputs.build_registry_repo}}
+          BR_WF_TRIGGER_PAT: ${{secrets.BR_WF_TRIGGER_PAT}}
+    
